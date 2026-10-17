@@ -5,63 +5,78 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
+import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.client.util.InputUtil;
+import net.minecraft.util.ActionResult;
 import net.minecraft.util.Identifier;
 import org.lwjgl.glfw.GLFW;
 
-import java.time.LocalTime;
-import java.time.format.DateTimeFormatter;
-import java.util.Locale;
-
 public class HudMod implements ClientModInitializer {
+    public static long tick = 1;
+    public static final long START = System.currentTimeMillis();
     private static KeyBinding openEditor;
 
     @Override
     public void onInitializeClient() {
-        MinecraftClient mc = MinecraftClient.getInstance();
-
-        add("fps", "FPS", () -> "FPS: " + mc.getCurrentFps());
-        add("cps", "CPS", () -> "CPS: " + CpsTracker.left() + " | " + CpsTracker.right());
-        add("xyz", "Koordinat", () -> mc.player == null ? "XYZ: -" :
-                String.format(Locale.ROOT, "XYZ: %.1f %.1f %.1f", mc.player.getX(), mc.player.getY(), mc.player.getZ()));
-        add("dir", "Yon", () -> mc.player == null ? "Yon: -" :
-                "Yon: " + mc.player.getHorizontalFacing().asString());
-        add("ping", "Ping", () -> {
-            if (mc.player == null || mc.getNetworkHandler() == null) return "Ping: -";
-            var e = mc.getNetworkHandler().getPlayerListEntry(mc.player.getUuid());
-            return "Ping: " + (e == null ? "-" : e.getLatency() + " ms");
-        });
-        add("speed", "Hiz", () -> mc.player == null ? "Hiz: -" :
-                String.format(Locale.ROOT, "Hiz: %.2f b/s", mc.player.getVelocity().horizontalLength() * 20));
-        add("time", "Saat", () -> LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")));
-
+        Elements.registerAll();
         HudConfig.load();
 
         openEditor = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.hudmod.editor", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_RIGHT_SHIFT,
                 KeyBinding.Category.create(Identifier.of("hudmod", "main"))));
 
-        ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            CpsTracker.poll();
-            while (openEditor.wasPressed()) client.setScreen(new HudEditorScreen());
+        AttackEntityCallback.EVENT.register((player, world, hand, entity, hit) -> {
+            if (world.isClient() && player == MinecraftClient.getInstance().player) Combat.onAttack(entity);
+            return ActionResult.PASS;
         });
 
+        ClientTickEvents.END_CLIENT_TICK.register(HudMod::onTick);
+
         HudElementRegistry.attachElementAfter(VanillaHudElements.MISC_OVERLAYS,
-                Identifier.of("hudmod", "hud"), (context, tickCounter) -> {
-                    if (mc.options.hudHidden || mc.currentScreen instanceof HudEditorScreen) return;
-                    CpsTracker.poll();
-                    for (HudElement e : HudConfig.ELEMENTS) {
-                        if (e.enabled) e.render(context, mc.textRenderer, false);
-                    }
-                });
+                Identifier.of("hudmod", "hud"), HudMod::renderHud);
     }
 
-    private static void add(String id, String name, java.util.function.Supplier<String> s) {
-        HudElement e = new HudElement(id, name, s);
-        e.x = 4;
-        e.y = 4 + HudConfig.ELEMENTS.size() * 18;
-        HudConfig.ELEMENTS.add(e);
+    private static boolean editing(MinecraftClient mc) {
+        return mc.currentScreen instanceof HudEditorScreen || mc.currentScreen instanceof SettingsScreen;
+    }
+
+    private static void onTick(MinecraftClient mc) {
+        tick++;
+        CpsTracker.poll(mc);
+        while (openEditor.wasPressed()) mc.setScreen(new HudEditorScreen());
+
+        if (mc.player != null && mc.player.hurtTime > 0) Combat.reset();
+
+        // Optimizasyon: odak dışındayken güncelleme yok
+        if (HudConfig.g("pause").on() && !mc.isWindowFocused()) return;
+
+        boolean perf = HudConfig.g("perf").on();
+        boolean edit = editing(mc);
+        if (tick % 10 == 0) FrameStats.compute();
+
+        for (HudElement e : HudConfig.ELEMENTS) {
+            // Kapalı elemanlar sadece editörde güncellenir
+            if (!e.enabled && !edit) continue;
+            int iv = e.interval * (perf ? 3 : 1);
+            // Elemanlar farklı tick'lere dağıtılır (aynı anda hepsi güncellenmesin)
+            if ((tick + e.idx) % iv == 0) e.update(mc);
+        }
+    }
+
+    private static void renderHud(DrawContext c, RenderTickCounter counter) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        FrameStats.frame();
+        CpsTracker.poll(mc);
+        if (mc.options.hudHidden || editing(mc)) return;
+        int sw = mc.getWindow().getScaledWidth(), sh = mc.getWindow().getScaledHeight();
+        for (HudElement e : HudConfig.ELEMENTS) {
+            if (!e.enabled) continue;
+            if (!e.ready) e.update(mc);
+            e.render(c, mc.textRenderer, false, false, sw, sh);
+        }
     }
 }
